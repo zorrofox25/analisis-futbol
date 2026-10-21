@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -128,22 +129,37 @@ def cargar_partidos_api(codigo_liga: str, api_token: str) -> pd.DataFrame:
                 "AwayTeam": str(equipo_visitante).strip(),
                 "FTHG": fthg,
                 "FTAG": ftag,
+                "MatchDate": partido.get("utcDate"),
+                "LastUpdated": partido.get("lastUpdated"),
+                "Status": partido.get("status", "FINISHED"),
             }
         )
 
-    partidos = pd.DataFrame(filas, columns=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
+    partidos = pd.DataFrame(
+        filas,
+        columns=[
+            "HomeTeam", "AwayTeam", "FTHG", "FTAG",
+            "MatchDate", "LastUpdated", "Status",
+        ],
+    )
     if partidos.empty:
         raise ValueError(
             f"La liga {codigo_liga} no devolvió partidos finalizados con marcador completo."
         )
+    partidos["MatchDate"] = pd.to_datetime(partidos["MatchDate"], utc=True, errors="coerce")
+    partidos["LastUpdated"] = pd.to_datetime(partidos["LastUpdated"], utc=True, errors="coerce")
+    partidos = partidos.sort_values("MatchDate", ascending=False, na_position="last").reset_index(drop=True)
+    partidos.attrs["consultado_en_utc"] = datetime.now(timezone.utc).isoformat()
+    partidos.attrs["fecha_respuesta_api"] = respuesta.headers.get("Date")
+    partidos.attrs["codigo_liga"] = codigo_liga
     return partidos
 
 
-def calcular_estadisticas(partidos: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Calcula promedios de goles por equipo y promedios generales de liga.
+def calcular_estadisticas(partidos: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Calcula rendimiento completo local/visitante y metadatos de los datos.
 
-    Para cada equipo se devuelven goles a favor y en contra por partido,
-    separando sus partidos como local y como visitante.
+    Además de los promedios de goles usados por Poisson, incluye partidos,
+    victorias, empates, derrotas, puntos y goles totales por condición.
     """
     requeridas = COLUMNAS_REQUERIDAS
     faltantes = requeridas.difference(partidos.columns)
@@ -152,27 +168,76 @@ def calcular_estadisticas(partidos: pd.DataFrame) -> tuple[pd.DataFrame, dict[st
     if partidos.empty:
         raise ValueError("No hay partidos para calcular estadísticas.")
 
-    local = partidos.groupby("HomeTeam").agg(
+    columnas = ["HomeTeam", "AwayTeam", "FTHG", "FTAG"]
+    datos = partidos.copy()
+    for columna in ("FTHG", "FTAG"):
+        datos[columna] = pd.to_numeric(datos[columna], errors="coerce")
+    datos = datos.dropna(subset=columnas)
+    if datos.empty:
+        raise ValueError("No hay marcadores válidos para calcular estadísticas.")
+
+    en_casa = datos.assign(
+        _victoria=(datos["FTHG"] > datos["FTAG"]).astype(int),
+        _empate=(datos["FTHG"] == datos["FTAG"]).astype(int),
+        _derrota=(datos["FTHG"] < datos["FTAG"]).astype(int),
+        _puntos=(datos["FTHG"] > datos["FTAG"]).astype(int) * 3
+        + (datos["FTHG"] == datos["FTAG"]).astype(int),
+    )
+    local = en_casa.groupby("HomeTeam").agg(
+        PJ_local=("FTHG", "size"),
+        PG_local=("_victoria", "sum"),
+        PE_local=("_empate", "sum"),
+        PP_local=("_derrota", "sum"),
+        Puntos_local=("_puntos", "sum"),
+        GF_total_local=("FTHG", "sum"),
+        GC_total_local=("FTAG", "sum"),
         GF_local=("FTHG", "mean"),
         GC_local=("FTAG", "mean"),
     )
-    visitante = partidos.groupby("AwayTeam").agg(
+    fuera = datos.assign(
+        _victoria=(datos["FTAG"] > datos["FTHG"]).astype(int),
+        _empate=(datos["FTAG"] == datos["FTHG"]).astype(int),
+        _derrota=(datos["FTAG"] < datos["FTHG"]).astype(int),
+        _puntos=(datos["FTAG"] > datos["FTHG"]).astype(int) * 3
+        + (datos["FTAG"] == datos["FTHG"]).astype(int),
+    )
+    visitante = fuera.groupby("AwayTeam").agg(
+        PJ_visitante=("FTAG", "size"),
+        PG_visitante=("_victoria", "sum"),
+        PE_visitante=("_empate", "sum"),
+        PP_visitante=("_derrota", "sum"),
+        Puntos_visitante=("_puntos", "sum"),
+        GF_total_visitante=("FTAG", "sum"),
+        GC_total_visitante=("FTHG", "sum"),
         GF_visitante=("FTAG", "mean"),
         GC_visitante=("FTHG", "mean"),
     )
 
-    # La unión conserva equipos aunque solo tengan datos como local o visitante.
     equipos = local.join(visitante, how="outer").sort_index()
+    fechas_partido = pd.to_datetime(datos.get("MatchDate"), utc=True, errors="coerce") if "MatchDate" in datos else pd.Series(dtype="datetime64[ns, UTC]")
+    fechas_actualizacion = pd.to_datetime(datos.get("LastUpdated"), utc=True, errors="coerce") if "LastUpdated" in datos else pd.Series(dtype="datetime64[ns, UTC]")
+
+    def max_iso(fechas: pd.Series) -> str | None:
+        """Devuelve la fecha UTC más reciente como ISO-8601, si existe."""
+        fechas_validas = fechas.dropna()
+        return fechas_validas.max().isoformat() if not fechas_validas.empty else None
+
     liga = {
-        "goles_local_por_partido": float(partidos["FTHG"].mean()),
-        "goles_visitante_por_partido": float(partidos["FTAG"].mean()),
+        "goles_local_por_partido": float(datos["FTHG"].mean()),
+        "goles_visitante_por_partido": float(datos["FTAG"].mean()),
+        "partidos_analizados": int(len(datos)),
+        "consultado_en_utc": partidos.attrs.get("consultado_en_utc"),
+        "fecha_respuesta_api": partidos.attrs.get("fecha_respuesta_api"),
+        "ultimo_partido_utc": max_iso(fechas_partido),
+        "ultima_actualizacion_api_utc": max_iso(fechas_actualizacion),
+        "codigo_liga": partidos.attrs.get("codigo_liga"),
     }
     return equipos, liga
 
 
 def obtener_metricas_dos_equipos(
     equipos: pd.DataFrame,
-    liga: dict[str, float],
+    liga: dict[str, Any],
     equipo_local: str,
     equipo_visitante: str,
 ) -> dict[str, Any]:
