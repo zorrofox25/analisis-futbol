@@ -74,6 +74,7 @@ def imprimir_reporte(
     print("\nGoles esperados (lambda):")
     print(f"  Local: {prediccion['lambda_local']:.3f}")
     print(f"  Visitante: {prediccion['lambda_visitante']:.3f}")
+    print(f"  Correlación Dixon–Coles (rho): {prediccion['rho_dixon_coles']:+.4f}")
 
     print("\nProbabilidades y cuotas:")
     print(f"  {'Mercado':<21} {'Modelo':>10} {'Cuota justa':>13} {'Cuota casa':>12} {'Implícita':>11} {'EV':>10}")
@@ -92,7 +93,7 @@ def imprimir_reporte(
         )
 
     print(f"\nOverround de la casa: {analisis_ev['overround_porcentaje']:+.2f}%")
-    print(f"Masa de probabilidad fuera de la matriz: {_porcentaje(prediccion['masa_omitida_matriz'])}")
+    print(f"Masa de probabilidad fuera de la matriz: {_porcentaje(prediccion['masa_omitida'])}")
 
     mercados_valor = analisis_ev["mercados_con_valor_positivo"]
     if not mercados_valor:
@@ -149,7 +150,7 @@ def main() -> None:
             prediccion["probabilidades_1x2"],
             cuotas_casa,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(2, f"Error: {exc}\n")
 
     imprimir_reporte(prediccion, analisis_ev)

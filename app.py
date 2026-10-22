@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from typing import Any
 
 import pandas as pd
@@ -234,16 +235,28 @@ def mostrar_pestana_resumen(analisis: dict[str, Any] | None) -> None:
                 {
                     "Selección": mercado,
                     "Prob. modelo": pred["probabilidades_1x2"][mercado],
+                    "Prob. equilibrio": datos["probabilidad_implicita"],
                     "Cuota justa": pred["cuotas_justas"][mercado],
                     "Cuota casa": datos["cuota_casa"],
                     "EV %": datos["ev_porcentaje"],
                 }
             )
         tabla = pd.DataFrame(filas)
+        margen_cols = st.columns(2)
+        margen_cols[0].metric(
+            "Overround 1X2",
+            f"{ev['overround_porcentaje']:+.2f}%",
+            help="Suma de probabilidades implícitas menos 100%. Puede ser negativo si hay underround.",
+        )
+        margen_cols[1].metric(
+            "Suma implícita de la casa",
+            f"{ev['probabilidad_implicita_total']:.2%}",
+        )
         st.dataframe(
             tabla.style.format(
                 {
                     "Prob. modelo": "{:.1%}",
+                    "Prob. equilibrio": "{:.1%}",
                     "Cuota justa": "{:.2f}",
                     "Cuota casa": "{:.2f}",
                     "EV %": "{:+.2f}%",
@@ -463,7 +476,7 @@ def main() -> None:
                 away_options = [equipo for equipo in disponibles if equipo != equipo_local]
                 equipo_visitante = st.selectbox("Equipo visitante", away_options, key="away_team")
             st.markdown("**Cuotas 1X2**")
-            st.caption("Introduce las cuotas decimales actuales de una casa de apuestas. Los valores iniciales son solo ejemplos y no deben usarse para evaluar EV+.")
+            st.caption("Ingresa las cuotas decimales actuales de una casa. No hay valores de ejemplo precargados.")
             cuotas_reales_confirmadas = st.checkbox(
                 "Confirmo que las cuotas introducidas son reales y están actualizadas",
                 value=False,
@@ -471,11 +484,20 @@ def main() -> None:
             )
             odds_cols = st.columns(3)
             with odds_cols[0]:
-                cuota_1 = st.number_input("Local (1)", min_value=1.01, value=2.10, step=0.01)
+                cuota_1 = st.number_input(
+                    "Local (1)", min_value=1.01, value=None, step=0.01,
+                    placeholder="Cuota actual", key="odds_1_real",
+                )
             with odds_cols[1]:
-                cuota_x = st.number_input("Empate (X)", min_value=1.01, value=3.40, step=0.01)
+                cuota_x = st.number_input(
+                    "Empate (X)", min_value=1.01, value=None, step=0.01,
+                    placeholder="Cuota actual", key="odds_X_real",
+                )
             with odds_cols[2]:
-                cuota_2 = st.number_input("Visitante (2)", min_value=1.01, value=3.60, step=0.01)
+                cuota_2 = st.number_input(
+                    "Visitante (2)", min_value=1.01, value=None, step=0.01,
+                    placeholder="Cuota actual", key="odds_2_real",
+                )
 
             cuotas_extra: dict[str, float] = {}
             with st.expander("Cuotas opcionales · Doble oportunidad, Over/Under 2.5, ambos marcan"):
@@ -483,29 +505,38 @@ def main() -> None:
                 if agregar_extra:
                     extra_cols = st.columns(4)
                     campos_extra = [
-                        ("1X", "Doble oportunidad 1X", 1.30),
-                        ("12", "Doble oportunidad 12", 1.30),
-                        ("X2", "Doble oportunidad X2", 1.30),
-                        ("O2.5", "Over 2.5", 1.90),
-                        ("U2.5", "Under 2.5", 1.90),
-                        ("BTTS_SI", "Ambos marcan · Sí", 1.90),
-                        ("BTTS_NO", "Ambos marcan · No", 1.90),
+                        ("1X", "Doble oportunidad 1X"),
+                        ("12", "Doble oportunidad 12"),
+                        ("X2", "Doble oportunidad X2"),
+                        ("O2.5", "Over 2.5"),
+                        ("U2.5", "Under 2.5"),
+                        ("BTTS_SI", "Ambos marcan · Sí"),
+                        ("BTTS_NO", "Ambos marcan · No"),
                     ]
-                    for indice, (codigo, etiqueta, valor_inicial) in enumerate(campos_extra):
+                    for indice, (codigo, etiqueta) in enumerate(campos_extra):
                         with extra_cols[indice % len(extra_cols)]:
-                            cuotas_extra[codigo] = st.number_input(
+                            cuota_extra = st.number_input(
                                 etiqueta,
                                 min_value=1.01,
-                                value=valor_inicial,
+                                value=None,
                                 step=0.01,
-                                key=f"odds_{codigo}",
+                                placeholder="Opcional",
+                                key=f"odds_real_{codigo}",
                             )
+                            if cuota_extra is not None:
+                                cuotas_extra[codigo] = float(cuota_extra)
             calcular = st.form_submit_button("Calcular y guardar pronóstico", type="primary", use_container_width=True)
 
+    cuotas_1x2_completas = all(
+        cuota is not None and math.isfinite(float(cuota)) and float(cuota) > 1.0
+        for cuota in (cuota_1, cuota_x, cuota_2)
+    )
     if calcular and not cuotas_reales_confirmadas:
-        st.warning("Antes de calcular el EV+, confirma que has sustituido las cuotas de ejemplo por cuotas reales y actualizadas.")
+        st.warning("Confirma que ingresaste cuotas reales y actuales. No se calculará EV ni se guardará un pronóstico sin esa confirmación.")
+    elif calcular and not cuotas_1x2_completas:
+        st.warning("Ingresa las tres cuotas 1X2 actuales. No se calculará EV ni se guardará el pronóstico mientras falte alguna.")
 
-    if calcular and cuotas_reales_confirmadas:
+    if calcular and cuotas_reales_confirmadas and cuotas_1x2_completas:
         try:
             # El motor avanzado ajusta fuerzas sobre resultados históricos, con
             # regularización por muestra y corrección Dixon–Coles para marcadores bajos.

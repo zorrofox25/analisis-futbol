@@ -261,11 +261,24 @@ def calcular_partido_poisson(
             for linea in (0.5, 1.5, 2.5, 3.5, 4.5)
         },
         "ambos_marcan": {"si": btts_si, "no": 1.0 - btts_si},
-        # La matriz visible se mide sin normalizar; así el truncamiento no queda
-        # oculto por la normalización de _matriz_dc.
+        # Dixon–Coles redistribuye masa entre 0-0, 0-1, 1-0 y 1-1, sin cambiar
+        # la masa total. El residuo omitido es por tanto la cola Poisson conjunta
+        # fuera de [0, max_goles]², medida antes de normalizar la matriz visible.
+        "masa_omitida": float(
+            max(
+                0.0,
+                1.0
+                - poisson.cdf(max_goles, lambda_local)
+                * poisson.cdf(max_goles, lambda_visitante),
+            )
+        ),
+        # Alias para consumidores de versiones anteriores.
         "masa_omitida_matriz": float(
-            max(0.0, 1.0 - _matriz_dc_sin_normalizar(
-                lambda_local, lambda_visitante, rho, max_goles
-            ).sum())
+            max(
+                0.0,
+                1.0
+                - poisson.cdf(max_goles, lambda_local)
+                * poisson.cdf(max_goles, lambda_visitante),
+            )
         ),
     }
