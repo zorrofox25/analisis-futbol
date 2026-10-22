@@ -3,3 +3,4 @@ numpy
 scipy
 requests
 streamlit
+psycopg[binary]>=3.2

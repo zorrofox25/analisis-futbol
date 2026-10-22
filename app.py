@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from typing import Any
 
 import pandas as pd
+import psycopg
 import streamlit as st
 
 from fase1_estadisticas import calcular_estadisticas, cargar_partidos_api
@@ -343,7 +343,7 @@ def mostrar_pestana_historial(estadisticas: dict[str, Any]) -> None:
 
     try:
         historial = leer_historial(limite=1000)
-    except (OSError, sqlite3.Error, ValueError) as exc:
+    except (OSError, psycopg.Error, RuntimeError, ValueError) as exc:
         st.error(f"No se pudo leer el historial: {exc}")
         return
     if historial.empty:
@@ -414,7 +414,7 @@ def main() -> None:
             equipos, liga, partidos = cargar_datos_liga(codigo_liga, token)
             liquidar_predicciones(partidos, codigo_liga)
             rendimiento = resumen_rendimiento()
-    except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+    except (RuntimeError, ValueError, OSError, psycopg.Error) as exc:
         st.error(f"No se pudieron cargar los datos: {exc}")
         st.stop()
 
@@ -538,7 +538,7 @@ def main() -> None:
             )
             try:
                 guardar_prediccion(registro)
-            except (OSError, sqlite3.Error) as exc:
+            except (OSError, psycopg.Error, RuntimeError) as exc:
                 st.warning(f"Análisis calculado; no se pudo guardar el historial: {exc}")
 
             st.session_state["analisis_actual"] = {
