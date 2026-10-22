@@ -1,175 +1,251 @@
-"""Modelo de goles, resultados y mercados derivados mediante Poisson."""
+"""Poisson con regularización de ataques/defensas y ajuste Dixon–Coles."""
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from scipy.stats import poisson
 
 
+@dataclass(frozen=True)
+class ModeloAjustado:
+    """Parámetros ajustados sobre los resultados históricos de la liga."""
+
+    equipos: tuple[str, ...]
+    intercepto: float
+    ventaja_local: float
+    ataques: np.ndarray
+    defensas: np.ndarray
+    rho: float
+
+
+def _validar_partidos(partidos: pd.DataFrame) -> pd.DataFrame:
+    requeridas = {"HomeTeam", "AwayTeam", "FTHG", "FTAG"}
+    faltantes = requeridas - set(partidos.columns)
+    if faltantes:
+        raise ValueError(f"Faltan columnas requeridas: {sorted(faltantes)}")
+
+    datos = partidos[["HomeTeam", "AwayTeam", "FTHG", "FTAG"]].copy()
+    datos["FTHG"] = pd.to_numeric(datos["FTHG"], errors="coerce")
+    datos["FTAG"] = pd.to_numeric(datos["FTAG"], errors="coerce")
+    datos = datos.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
+    if datos.empty:
+        raise ValueError("No hay resultados válidos para ajustar el modelo.")
+    goles = datos[["FTHG", "FTAG"]].to_numpy(dtype=float)
+    if (goles < 0).any() or not np.allclose(goles, np.round(goles)):
+        raise ValueError("Los goles deben ser enteros no negativos.")
+    datos["FTHG"] = datos["FTHG"].astype(int)
+    datos["FTAG"] = datos["FTAG"].astype(int)
+    return datos.reset_index(drop=True)
+
+
+def _tau_dc(
+    goles_local: np.ndarray,
+    goles_visitante: np.ndarray,
+    lambda_local: np.ndarray,
+    lambda_visitante: np.ndarray,
+    rho: float,
+) -> np.ndarray:
+    """Factor Dixon–Coles, distinto de 1 solo en los cuatro marcadores bajos."""
+    tau = np.ones_like(lambda_local, dtype=float)
+    m00 = (goles_local == 0) & (goles_visitante == 0)
+    m01 = (goles_local == 0) & (goles_visitante == 1)
+    m10 = (goles_local == 1) & (goles_visitante == 0)
+    m11 = (goles_local == 1) & (goles_visitante == 1)
+    tau[m00] = 1 - lambda_local[m00] * lambda_visitante[m00] * rho
+    tau[m01] = 1 + lambda_local[m01] * rho
+    tau[m10] = 1 + lambda_visitante[m10] * rho
+    tau[m11] = 1 - rho
+    return tau
+
+
+def ajustar_modelo(
+    partidos: pd.DataFrame,
+    *,
+    fuerza_prior: float = 8.0,
+    limite_rho: float = 0.10,
+) -> ModeloAjustado:
+    """Ajusta fuerzas con un prior de liga y corrige marcadores bajos.
+
+    ``fuerza_prior`` es el peso del prior centrado en la media de liga. Al ser
+    una penalización fija frente a la verosimilitud, los equipos con pocas
+    observaciones quedan más cerca del promedio que los equipos con más datos.
+    """
+    if fuerza_prior < 0:
+        raise ValueError("fuerza_prior no puede ser negativo.")
+    if not 0 < limite_rho <= 0.15:
+        raise ValueError("limite_rho debe estar entre 0 y 0.15.")
+
+    datos = _validar_partidos(partidos)
+    equipos = tuple(sorted(set(datos["HomeTeam"]) | set(datos["AwayTeam"])))
+    n = len(equipos)
+    if n < 2:
+        raise ValueError("Se necesitan al menos dos equipos.")
+
+    indice = {equipo: i for i, equipo in enumerate(equipos)}
+    idx_h = datos["HomeTeam"].map(indice).to_numpy(dtype=int)
+    idx_a = datos["AwayTeam"].map(indice).to_numpy(dtype=int)
+    goles_h = datos["FTHG"].to_numpy(dtype=float)
+    goles_a = datos["FTAG"].to_numpy(dtype=float)
+
+    def expandir(parametros: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        ataque_libre = parametros[: n - 1]
+        defensa_libre = parametros[n - 1 : 2 * (n - 1)]
+        ataque = np.append(ataque_libre, -ataque_libre.sum())
+        defensa = np.append(defensa_libre, -defensa_libre.sum())
+        return ataque, defensa
+
+    def objetivo(parametros: np.ndarray) -> float:
+        intercepto, ventaja = parametros[:2]
+        ataque, defensa = expandir(parametros[2:-1])
+        rho = float(parametros[-1])
+        try:
+            lam_h = np.exp(intercepto + ventaja + ataque[idx_h] - defensa[idx_a])
+            lam_a = np.exp(intercepto + ataque[idx_a] - defensa[idx_h])
+        except FloatingPointError:
+            return 1e100
+        if not np.isfinite(lam_h).all() or not np.isfinite(lam_a).all():
+            return 1e100
+        tau = _tau_dc(goles_h, goles_a, lam_h, lam_a, rho)
+        if (tau <= 0).any():
+            return 1e100
+
+        log_likelihood = (
+            poisson.logpmf(goles_h, lam_h)
+            + poisson.logpmf(goles_a, lam_a)
+            + np.log(tau)
+        ).sum()
+        penalizacion = 0.5 * fuerza_prior * (
+            np.square(ataque).sum() + np.square(defensa).sum()
+        )
+        return float(-log_likelihood + penalizacion)
+
+    media_goles = max(float(np.mean(np.r_[goles_h, goles_a])), 0.05)
+    inicial = np.zeros(2 + 2 * (n - 1) + 1, dtype=float)
+    inicial[0] = np.log(media_goles)
+    limites = [(None, None)] * (len(inicial) - 1) + [(-limite_rho, limite_rho)]
+    ajuste = minimize(objetivo, inicial, method="L-BFGS-B", bounds=limites)
+    if not np.isfinite(ajuste.fun):
+        raise RuntimeError(f"No se pudo ajustar el modelo: {ajuste.message}")
+
+    ataque, defensa = expandir(ajuste.x[2:-1])
+    return ModeloAjustado(
+        equipos=equipos,
+        intercepto=float(ajuste.x[0]),
+        ventaja_local=float(ajuste.x[1]),
+        ataques=ataque,
+        defensas=defensa,
+        rho=float(ajuste.x[-1]),
+    )
+
+
+def _matriz_dc(lambda_local: float, lambda_visitante: float, rho: float, max_goles: int) -> np.ndarray:
+    goles = np.arange(max_goles + 1)
+    matriz = np.outer(poisson.pmf(goles, lambda_local), poisson.pmf(goles, lambda_visitante))
+    matriz[0, 0] *= 1 - lambda_local * lambda_visitante * rho
+    if max_goles >= 1:
+        matriz[0, 1] *= 1 + lambda_local * rho
+        matriz[1, 0] *= 1 + lambda_visitante * rho
+        matriz[1, 1] *= 1 - rho
+    if (matriz < 0).any() or matriz.sum() <= 0:
+        raise ValueError("La corrección Dixon–Coles produjo probabilidades inválidas.")
+    return matriz / matriz.sum()
+
+
 def calcular_partido_poisson(
-    equipos: pd.DataFrame,
-    liga: Mapping[str, Any],
+    partidos: pd.DataFrame,
     equipo_local: str,
     equipo_visitante: str,
+    *,
     max_goles: int = 10,
+    fuerza_prior: float = 8.0,
+    limite_rho: float = 0.10,
 ) -> dict[str, Any]:
-    """Calcula fuerzas, lambdas, marcadores y probabilidades de varios mercados.
+    """Ajusta el modelo histórico y calcula probabilidades para el encuentro."""
+    if equipo_local == equipo_visitante:
+        raise ValueError("El equipo local y el visitante deben ser distintos.")
+    if max_goles < 5:
+        raise ValueError("max_goles debe ser al menos 5.")
 
-    La matriz exacta se presenta entre 0 y ``max_goles``. Las probabilidades
-    1X2 se calculan sobre un soporte ampliado hasta cubrir al menos el 99.9999999999%
-    de la masa de cada Poisson. Los totales usan que la suma de dos Poisson
-    independientes también es Poisson; ambos marcan se deriva de las masas en 0.
-    """
-    if max_goles < 1:
-        raise ValueError("max_goles debe ser al menos 1.")
-
-    ausentes = [equipo for equipo in (equipo_local, equipo_visitante) if equipo not in equipos.index]
+    modelo = ajustar_modelo(partidos, fuerza_prior=fuerza_prior, limite_rho=limite_rho)
+    posiciones = {equipo: i for i, equipo in enumerate(modelo.equipos)}
+    ausentes = [e for e in (equipo_local, equipo_visitante) if e not in posiciones]
     if ausentes:
-        raise ValueError(f"No se encontraron estos equipos: {', '.join(ausentes)}")
+        raise ValueError(f"Equipos no encontrados en el histórico: {', '.join(ausentes)}")
 
-    columnas = ("GF_local", "GC_local", "GF_visitante", "GC_visitante")
-    faltantes = [columna for columna in columnas if columna not in equipos.columns]
-    if faltantes:
-        raise ValueError(f"Faltan métricas de la Fase 1: {', '.join(faltantes)}")
+    i_h, i_a = posiciones[equipo_local], posiciones[equipo_visitante]
+    lambda_local = float(np.exp(
+        modelo.intercepto + modelo.ventaja_local + modelo.ataques[i_h] - modelo.defensas[i_a]
+    ))
+    lambda_visitante = float(np.exp(
+        modelo.intercepto + modelo.ataques[i_a] - modelo.defensas[i_h]
+    ))
+    rho = modelo.rho
 
-    try:
-        media_local = float(liga["goles_local_por_partido"])
-        media_visitante = float(liga["goles_visitante_por_partido"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("El diccionario liga no contiene medias válidas de goles.") from exc
-    if not np.isfinite(media_local) or not np.isfinite(media_visitante):
-        raise ValueError("Las medias de liga deben ser finitas.")
-    if media_local <= 0 or media_visitante <= 0:
-        raise ValueError("Las medias de goles de liga deben ser mayores que cero.")
-
-    local = equipos.loc[equipo_local]
-    visitante = equipos.loc[equipo_visitante]
-    necesarios = [local[col] for col in columnas] + [visitante[col] for col in columnas]
-    if any(pd.isna(valor) for valor in necesarios):
-        raise ValueError(
-            "Faltan promedios en condición local o visitante para uno de los equipos."
-        )
-
-    ataque_local = float(local["GF_local"]) / media_local
-    defensa_local = float(local["GC_local"]) / media_visitante
-    ataque_visitante = float(visitante["GF_visitante"]) / media_visitante
-    defensa_visitante = float(visitante["GC_visitante"]) / media_local
-
-    lambda_local = media_local * ataque_local * defensa_visitante
-    lambda_visitante = media_visitante * ataque_visitante * defensa_local
-    if not np.isfinite(lambda_local) or not np.isfinite(lambda_visitante):
-        raise ValueError("El modelo produjo lambdas no finitas.")
-    if lambda_local < 0 or lambda_visitante < 0:
-        raise ValueError("Las lambdas no pueden ser negativas.")
-
-    # Matriz de marcadores para presentación (límite configurable por el llamador).
-    goles_mostrados = np.arange(max_goles + 1)
-    pmf_local_mostrada = poisson.pmf(goles_mostrados, lambda_local)
-    pmf_visitante_mostrada = poisson.pmf(goles_mostrados, lambda_visitante)
-    matriz = pd.DataFrame(
-        pmf_local_mostrada[:, None] * pmf_visitante_mostrada[None, :],
-        index=pd.Index(goles_mostrados, name="Goles_local"),
-        columns=pd.Index(goles_mostrados, name="Goles_visitante"),
+    # La matriz visible usa el límite indicado; los mercados se calculan sobre
+    # un soporte mayor para que el truncamiento de marcadores altos sea mínimo.
+    matriz = _matriz_dc(lambda_local, lambda_visitante, rho, max_goles)
+    soporte = max(
+        max_goles,
+        int(poisson.ppf(1 - 1e-12, lambda_local)),
+        int(poisson.ppf(1 - 1e-12, lambda_visitante)),
     )
-    masa_matriz = float(matriz.to_numpy().sum())
+    soporte = min(soporte, 100)
+    matriz_completa = _matriz_dc(lambda_local, lambda_visitante, rho, soporte)
+    goles = np.arange(soporte + 1)
+    hh, aa = np.meshgrid(goles, goles, indexing="ij")
 
-    # Ampliamos el soporte para calcular 1X2 sin truncar la matriz que se muestra.
-    cuantiles = [
-        float(poisson.ppf(1.0 - 1e-12, lam)) if lam > 0 else 0.0
-        for lam in (lambda_local, lambda_visitante)
-    ]
-    max_soporte = max(max_goles, int(max(cuantiles)) + 1)
-    max_soporte = min(max_soporte, 1000)
-    goles_soporte = np.arange(max_soporte + 1)
-    pmf_local = poisson.pmf(goles_soporte, lambda_local)
-    pmf_visitante = poisson.pmf(goles_soporte, lambda_visitante)
-
-    # P(local gana) = sum P(H=i) P(A<i), y análogo para visitante.
-    prob_1 = float(np.sum(pmf_local * poisson.cdf(goles_soporte - 1, lambda_visitante)))
-    prob_x = float(np.sum(pmf_local * pmf_visitante))
-    prob_2 = float(np.sum(pmf_visitante * poisson.cdf(goles_soporte - 1, lambda_local)))
-    masa_1x2 = prob_1 + prob_x + prob_2
-    if masa_1x2 <= 0:
-        raise ValueError("No se pudo calcular la distribución de resultados 1X2.")
-
-    # Normalización por el residuo numérico del soporte finito.
     probabilidades = {
-        "1": prob_1 / masa_1x2,
-        "X": prob_x / masa_1x2,
-        "2": prob_2 / masa_1x2,
+        "1": float(matriz_completa[hh > aa].sum()),
+        "X": float(matriz_completa[hh == aa].sum()),
+        "2": float(matriz_completa[hh < aa].sum()),
     }
-    cuotas_justas = {
-        mercado: 1.0 / probabilidad if probabilidad > 0 else float("inf")
-        for mercado, probabilidad in probabilidades.items()
-    }
+    suma_1x2 = sum(probabilidades.values())
+    probabilidades = {k: v / suma_1x2 for k, v in probabilidades.items()}
+    cuotas_justas = {k: 1.0 / v if v > 0 else float("inf") for k, v in probabilidades.items()}
 
-    lambda_total = lambda_local + lambda_visitante
-    lineas_totales: dict[str, dict[str, float]] = {}
-    for linea in (0.5, 1.5, 2.5, 3.5, 4.5):
-        # En una línea x.5, over significa un total >= ceil(x + 0.5).
-        minimo_over = int(linea + 0.5)
-        prob_over = float(poisson.sf(minimo_over - 1, lambda_total))
-        lineas_totales[f"{linea:.1f}"] = {
-            "over": prob_over,
-            "under": 1.0 - prob_over,
-        }
-
-    prob_local_marca = float(1.0 - poisson.pmf(0, lambda_local))
-    prob_visitante_marca = float(1.0 - poisson.pmf(0, lambda_visitante))
-    ambos_marcan_si = prob_local_marca * prob_visitante_marca
-
-    matriz_np = matriz.to_numpy()
-    cantidad_top = min(5, matriz_np.size)
-    indices_top = np.argsort(matriz_np, axis=None)[-cantidad_top:][::-1]
+    total = hh + aa
+    btts_si = float(matriz_completa[(hh > 0) & (aa > 0)].sum())
+    top_indices = np.argsort(matriz.ravel())[-5:][::-1]
     marcadores_top = []
-    for indice in indices_top:
-        goles_local, goles_visitante = np.unravel_index(indice, matriz_np.shape)
-        marcadores_top.append(
-            {
-                "marcador": f"{goles_local}-{goles_visitante}",
-                "probabilidad": float(matriz_np[goles_local, goles_visitante]),
-            }
-        )
+    for flat_idx in top_indices:
+        gh, ga = np.unravel_index(flat_idx, matriz.shape)
+        marcadores_top.append({
+            "marcador": f"{gh}-{ga}",
+            "probabilidad": float(matriz[gh, ga]),
+        })
 
     return {
         "equipo_local": equipo_local,
         "equipo_visitante": equipo_visitante,
         "fuerzas": {
-            "ataque_local": ataque_local,
-            "defensa_local": defensa_local,
-            "ataque_visitante": ataque_visitante,
-            "defensa_visitante": defensa_visitante,
-        },
-        "desglose_lambda": {
-            "local": {
-                "media_liga_local": media_local,
-                "fuerza_ataque_local": ataque_local,
-                "fuerza_defensa_visitante": defensa_visitante,
-                "formula": "media_liga_local × ataque_local × defensa_visitante",
-            },
-            "visitante": {
-                "media_liga_visitante": media_visitante,
-                "fuerza_ataque_visitante": ataque_visitante,
-                "fuerza_defensa_local": defensa_local,
-                "formula": "media_liga_visitante × ataque_visitante × defensa_local",
-            },
+            "ataque_local": float(np.exp(modelo.ataques[i_h])),
+            "defensa_local": float(np.exp(modelo.defensas[i_h])),
+            "ataque_visitante": float(np.exp(modelo.ataques[i_a])),
+            "defensa_visitante": float(np.exp(modelo.defensas[i_a])),
         },
         "lambda_local": lambda_local,
         "lambda_visitante": lambda_visitante,
-        "lambda_total": lambda_total,
-        "matriz_marcadores": matriz,
+        "lambda_total": lambda_local + lambda_visitante,
+        "rho_dixon_coles": rho,
+        "matriz_marcadores": pd.DataFrame(
+            matriz, index=pd.Index(range(max_goles + 1), name="Goles_local"),
+            columns=pd.Index(range(max_goles + 1), name="Goles_visitante"),
+        ),
         "marcadores_mas_probables": marcadores_top,
         "probabilidades_1x2": probabilidades,
         "cuotas_justas": cuotas_justas,
-        "soporte_1x2_max_goles": max_soporte,
-        "masa_omitida_1x2": max(0.0, 1.0 - masa_1x2),
-        "masa_omitida_matriz": max(0.0, 1.0 - masa_matriz),
-        "totales_goles": lineas_totales,
-        "ambos_marcan": {
-            "si": ambos_marcan_si,
-            "no": 1.0 - ambos_marcan_si,
+        "totales_goles": {
+            f"{linea:.1f}": {
+                "over": float(matriz_completa[total >= int(linea + 0.5)].sum()),
+                "under": float(matriz_completa[total < int(linea + 0.5)].sum()),
+            }
+            for linea in (0.5, 1.5, 2.5, 3.5, 4.5)
         },
+        "ambos_marcan": {"si": btts_si, "no": 1.0 - btts_si},
+        "masa_omitida_matriz": float(max(0.0, 1.0 - matriz.sum())),
     }

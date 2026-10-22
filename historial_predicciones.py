@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
+import numpy as np
 import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
@@ -38,6 +39,22 @@ class PrediccionGuardada:
     pronostico_1x2: str
     mercado_recomendado: str | None
     cuota_recomendada: float | None
+    metricas_avanzadas: dict[str, Any] | None = None
+
+
+def _json_default(valor: Any) -> Any:
+    """Convierte tipos NumPy/Pandas usados por el modelo a JSON estándar."""
+    if isinstance(valor, pd.DataFrame):
+        return {
+            "index": valor.index.tolist(),
+            "columns": valor.columns.tolist(),
+            "values": valor.to_numpy().tolist(),
+        }
+    if isinstance(valor, (np.integer, np.floating, np.bool_)):
+        return valor.item()
+    if isinstance(valor, (pd.Timestamp, datetime)):
+        return valor.isoformat()
+    raise TypeError(f"Tipo no serializable a JSON: {type(valor).__name__}")
 
 
 CREATE_TABLE_SQL = """
@@ -134,7 +151,7 @@ def guardar_prediccion(prediccion: PrediccionGuardada) -> int:
         prediccion.pronostico_1x2,
         prediccion.mercado_recomendado,
         prediccion.cuota_recomendada,
-        json.dumps(datos, ensure_ascii=False),
+        json.dumps(datos, ensure_ascii=False, default=_json_default),
     )
     with _conectar() as conexion:
         fila = conexion.execute(

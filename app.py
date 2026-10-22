@@ -192,7 +192,7 @@ def estilizar_mercados(tabla: pd.DataFrame) -> Any:
 
 
 def mostrar_pestana_resumen(analisis: dict[str, Any] | None) -> None:
-    """Presenta probabilidades 1X2, cuotas justas y goles esperados."""
+    """Presenta salidas del modelo ajustado, cuotas y goles esperados."""
     if not analisis:
         st.info("Selecciona equipos y pulsa **Calcular análisis** para generar el pronóstico.")
         return
@@ -214,9 +214,17 @@ def mostrar_pestana_resumen(analisis: dict[str, Any] | None) -> None:
         xg[0].metric(pred["equipo_local"], f"{pred['lambda_local']:.2f}")
         xg[1].metric(pred["equipo_visitante"], f"{pred['lambda_visitante']:.2f}")
         st.caption(
-            f"Desglose: λ local = media de liga × ataque local × defensa visitante; "
-            f"λ visitante = media de liga × ataque visitante × defensa local."
+            "Las lambdas se estiman conjuntamente con los resultados históricos; "
+            "las fuerzas de ataque y defensa incluyen ajuste por rival y shrinkage."
         )
+        fuerzas = pred["fuerzas"]
+        st.markdown("**Fuerzas relativas a la media de liga**")
+        fuerza_cols = st.columns(2)
+        fuerza_cols[0].metric("Ataque local", f"{fuerzas['ataque_local']:.2f}×")
+        fuerza_cols[1].metric("Defensa local", f"{fuerzas['defensa_local']:.2f}×")
+        fuerza_cols[0].metric("Ataque visitante", f"{fuerzas['ataque_visitante']:.2f}×")
+        fuerza_cols[1].metric("Defensa visitante", f"{fuerzas['defensa_visitante']:.2f}×")
+        st.metric("ρ · Dixon–Coles", f"{pred['rho_dixon_coles']:+.4f}")
     with cols[1], st.container(border=True):
         st.markdown("**Mercado 1X2 frente a la casa**")
         filas = []
@@ -262,7 +270,10 @@ def mostrar_pestana_mercados(analisis: dict[str, Any] | None) -> None:
     if not analisis:
         st.info("Calcula un pronóstico para ver probabilidades y cuotas justas.")
         return
-    st.caption("Las filas verdes tienen EV positivo. EV se calcula solo cuando ingresaste una cuota de casa.")
+    st.caption(
+        "Las probabilidades usan Poisson con shrinkage y corrección Dixon–Coles. "
+        "Las filas verdes tienen EV positivo y requieren una cuota de casa."
+    )
     tabla = construir_mercados(
         analisis["prediccion"], analisis["resumen_ev"], analisis["cuotas_extra"]
     )
@@ -487,13 +498,19 @@ def main() -> None:
 
     if calcular:
         try:
-            prediccion = calcular_partido_poisson(equipos, liga, equipo_local, equipo_visitante)
+            # El motor avanzado ajusta fuerzas sobre resultados históricos, con
+            # regularización por muestra y corrección Dixon–Coles para marcadores bajos.
+            prediccion = calcular_partido_poisson(
+                partidos,
+                equipo_local,
+                equipo_visitante,
+            )
             resumen_ev = analizar_valor_esperado(
                 prediccion["probabilidades_1x2"],
                 {"1": cuota_1, "X": cuota_x, "2": cuota_2},
             )
             tabla_mercados = construir_mercados(prediccion, resumen_ev, cuotas_extra)
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, RuntimeError) as exc:
             st.error(f"No se pudo calcular el análisis: {exc}")
         else:
             candidatos = tabla_mercados.dropna(subset=["Cuota casa", "EV %"])
@@ -535,6 +552,14 @@ def main() -> None:
                 pronostico_1x2=pronostico_modal,
                 mercado_recomendado=mercado_recomendado,
                 cuota_recomendada=cuota_recomendada,
+                metricas_avanzadas={
+                    "modelo": prediccion,
+                    "valor_esperado": resumen_ev,
+                    "cuotas_extra": cuotas_extra,
+                    "mercados": tabla_mercados.astype(object)
+                    .where(pd.notna(tabla_mercados), None)
+                    .to_dict(orient="records"),
+                },
             )
             try:
                 guardar_prediccion(registro)
