@@ -178,18 +178,33 @@ def calcular_partido_poisson(
     max_goles: int = 10,
     fuerza_prior: float = 8.0,
     limite_rho: float = 0.10,
+    min_partidos_equipo: int = 6,
 ) -> dict[str, Any]:
     """Ajusta el modelo histórico y calcula probabilidades para el encuentro."""
     if equipo_local == equipo_visitante:
         raise ValueError("El equipo local y el visitante deben ser distintos.")
     if max_goles < 5:
         raise ValueError("max_goles debe ser al menos 5.")
+    if min_partidos_equipo < 1:
+        raise ValueError("min_partidos_equipo debe ser al menos 1.")
 
-    modelo = ajustar_modelo(partidos, fuerza_prior=fuerza_prior, limite_rho=limite_rho)
+    datos_validos = _validar_partidos(partidos)
+    modelo = ajustar_modelo(datos_validos, fuerza_prior=fuerza_prior, limite_rho=limite_rho)
     posiciones = {equipo: i for i, equipo in enumerate(modelo.equipos)}
     ausentes = [e for e in (equipo_local, equipo_visitante) if e not in posiciones]
     if ausentes:
         raise ValueError(f"Equipos no encontrados en el histórico: {', '.join(ausentes)}")
+
+    conteos = pd.concat(
+        [datos_validos["HomeTeam"], datos_validos["AwayTeam"]],
+        ignore_index=True,
+    ).value_counts()
+    conteo_local = int(conteos.get(equipo_local, 0))
+    conteo_visitante = int(conteos.get(equipo_visitante, 0))
+    muestra_suficiente = (
+        conteo_local >= min_partidos_equipo
+        and conteo_visitante >= min_partidos_equipo
+    )
 
     i_h, i_a = posiciones[equipo_local], posiciones[equipo_visitante]
     lambda_local = float(np.exp(
@@ -236,6 +251,12 @@ def calcular_partido_poisson(
     return {
         "equipo_local": equipo_local,
         "equipo_visitante": equipo_visitante,
+        "partidos_historicos_equipo": {
+            "local": conteo_local,
+            "visitante": conteo_visitante,
+        },
+        "min_partidos_equipo": min_partidos_equipo,
+        "muestra_suficiente": muestra_suficiente,
         "fuerzas": {
             "ataque_local": float(np.exp(modelo.ataques[i_h])),
             "defensa_local": float(np.exp(modelo.defensas[i_h])),

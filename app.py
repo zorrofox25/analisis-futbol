@@ -199,6 +199,7 @@ def mostrar_pestana_resumen(analisis: dict[str, Any] | None) -> None:
         return
     pred = analisis["prediccion"]
     ev = analisis["resumen_ev"]
+    mostrar_aviso_muestra(pred)
     with st.container(border=True):
         st.markdown(f"#### {pred['equipo_local']} vs {pred['equipo_visitante']}")
         cols = st.columns(3)
@@ -268,7 +269,17 @@ def mostrar_pestana_resumen(analisis: dict[str, Any] | None) -> None:
     probs = pred["probabilidades_1x2"]
     pick = max(probs, key=probs.get)
     recomendacion = analisis.get("etiqueta_recomendada")
-    if recomendacion:
+    if not pred["muestra_suficiente"]:
+        etiqueta = analisis.get("etiqueta_ev_matematico")
+        ev_pct = analisis.get("ev_matematico_pct")
+        if etiqueta and ev_pct is not None:
+            st.info(
+                f"EV matemático: **{etiqueta} (+{ev_pct:.2f}%)**. "
+                "No es un EV validado ni una recomendación: la muestra es insuficiente."
+            )
+        else:
+            st.info("La muestra es insuficiente; no se valida ni se recomienda ninguna apuesta.")
+    elif recomendacion:
         st.success(
             f"Mayor valor positivo: **{recomendacion}** · EV "
             f"**+{analisis['ev_recomendado_pct']:.2f}%**. "
@@ -283,15 +294,33 @@ def mostrar_pestana_mercados(analisis: dict[str, Any] | None) -> None:
     if not analisis:
         st.info("Calcula un pronóstico para ver probabilidades y cuotas justas.")
         return
+    mostrar_aviso_muestra(analisis["prediccion"])
     st.caption(
         "Las probabilidades usan Poisson con shrinkage y corrección Dixon–Coles. "
-        "Las filas verdes tienen EV positivo y requieren una cuota de casa."
+        "Las filas verdes indican EV matemático positivo; solo se considera validado "
+        "cuando ambos equipos alcanzan el mínimo de partidos."
     )
     tabla = construir_mercados(
         analisis["prediccion"], analisis["resumen_ev"], analisis["cuotas_extra"]
     )
     st.dataframe(estilizar_mercados(tabla), hide_index=True, use_container_width=True)
     st.caption("Las cuotas no ingresadas se muestran como —; se presenta la probabilidad del modelo y la cuota justa.")
+
+
+def mostrar_aviso_muestra(prediccion: dict[str, Any]) -> None:
+    """Advierte cuando alguno de los equipos tiene pocos partidos históricos."""
+    if prediccion["muestra_suficiente"]:
+        return
+    conteos = prediccion["partidos_historicos_equipo"]
+    minimo = prediccion["min_partidos_equipo"]
+    st.warning(
+        "Advertencia: muestra estadística insuficiente "
+        f"(mínimo {minimo} partidos por equipo; "
+        f"{prediccion['equipo_local']}: {conteos['local']}, "
+        f"{prediccion['equipo_visitante']}: {conteos['visitante']}). "
+        "Las probabilidades y el EV matemático pueden estar descalibrados y "
+        "no deben considerarse una recomendación firme."
+    )
 
 
 def mostrar_pestana_estadisticas(
@@ -531,6 +560,9 @@ def main() -> None:
         cuota is not None and math.isfinite(float(cuota)) and float(cuota) > 1.0
         for cuota in (cuota_1, cuota_x, cuota_2)
     )
+    if calcular:
+        # Evita que un pronóstico anterior parezca corresponder a este envío.
+        st.session_state.pop("analisis_actual", None)
     if calcular and not cuotas_reales_confirmadas:
         st.warning("Confirma que ingresaste cuotas reales y actuales. No se calculará EV ni se guardará un pronóstico sin esa confirmación.")
     elif calcular and not cuotas_1x2_completas:
@@ -556,15 +588,26 @@ def main() -> None:
             candidatos = tabla_mercados.dropna(subset=["Cuota casa", "EV %"])
             candidatos = candidatos[candidatos["EV %"] > 0]
             if candidatos.empty:
-                mercado_recomendado, cuota_recomendada, ev_recomendado, etiqueta_recomendada = (
-                    None, None, None, None
-                )
+                mercado_ev_matematico = cuota_ev_matematica = None
+                ev_matematico_pct = etiqueta_ev_matematico = None
             else:
                 mejor = candidatos.sort_values("EV %", ascending=False).iloc[0]
-                mercado_recomendado = str(mejor["Código"])
-                cuota_recomendada = float(mejor["Cuota casa"])
-                ev_recomendado = float(mejor["EV %"])
-                etiqueta_recomendada = str(mejor["Mercado"])
+                mercado_ev_matematico = str(mejor["Código"])
+                cuota_ev_matematica = float(mejor["Cuota casa"])
+                ev_matematico_pct = float(mejor["EV %"])
+                etiqueta_ev_matematico = str(mejor["Mercado"])
+
+            # Un +EV numérico solo se convierte en recomendación validada si
+            # ambos equipos alcanzan el mínimo histórico configurado.
+            muestra_suficiente = bool(prediccion["muestra_suficiente"])
+            if muestra_suficiente and mercado_ev_matematico is not None:
+                mercado_recomendado = mercado_ev_matematico
+                cuota_recomendada = cuota_ev_matematica
+                ev_recomendado = ev_matematico_pct
+                etiqueta_recomendada = etiqueta_ev_matematico
+            else:
+                mercado_recomendado = cuota_recomendada = None
+                ev_recomendado = etiqueta_recomendada = None
 
             pronostico_modal = max(
                 prediccion["probabilidades_1x2"],
@@ -614,6 +657,11 @@ def main() -> None:
                 "etiqueta_recomendada": etiqueta_recomendada,
                 "cuota_recomendada": cuota_recomendada,
                 "ev_recomendado_pct": ev_recomendado,
+                "mercado_ev_matematico": mercado_ev_matematico,
+                "etiqueta_ev_matematico": etiqueta_ev_matematico,
+                "cuota_ev_matematica": cuota_ev_matematica,
+                "ev_matematico_pct": ev_matematico_pct,
+                "recomendacion_validada": muestra_suficiente and mercado_recomendado is not None,
             }
             st.session_state["partido_actual"] = (equipo_local, equipo_visitante)
 
