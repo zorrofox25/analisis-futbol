@@ -92,7 +92,7 @@ def imprimir_reporte(
         )
 
     print(f"\nOverround de la casa: {analisis_ev['overround_porcentaje']:+.2f}%")
-    print(f"Masa de probabilidad fuera de la matriz: {_porcentaje(prediccion['masa_omitida'])}")
+    print(f"Masa de probabilidad fuera de la matriz: {_porcentaje(prediccion['masa_omitida_matriz'])}")
 
     mercados_valor = analisis_ev["mercados_con_valor_positivo"]
     if not mercados_valor:
@@ -140,11 +140,10 @@ def main() -> None:
         partidos = cargar_partidos_api(args.liga, api_token)
         equipos, liga = calcular_estadisticas(partidos)
         prediccion = calcular_partido_poisson(
-            equipos,
-            liga,
+            partidos,
             args.local,
             args.visitante,
-            max_goles=args.max_goles,
+            max_goles=max(args.max_goles, 5),
         )
         analisis_ev = analizar_valor_esperado(
             prediccion["probabilidades_1x2"],

@@ -463,6 +463,12 @@ def main() -> None:
                 away_options = [equipo for equipo in disponibles if equipo != equipo_local]
                 equipo_visitante = st.selectbox("Equipo visitante", away_options, key="away_team")
             st.markdown("**Cuotas 1X2**")
+            st.caption("Introduce las cuotas decimales actuales de una casa de apuestas. Los valores iniciales son solo ejemplos y no deben usarse para evaluar EV+.")
+            cuotas_reales_confirmadas = st.checkbox(
+                "Confirmo que las cuotas introducidas son reales y están actualizadas",
+                value=False,
+                key="cuotas_reales_confirmadas",
+            )
             odds_cols = st.columns(3)
             with odds_cols[0]:
                 cuota_1 = st.number_input("Local (1)", min_value=1.01, value=2.10, step=0.01)
@@ -496,7 +502,10 @@ def main() -> None:
                             )
             calcular = st.form_submit_button("Calcular y guardar pronóstico", type="primary", use_container_width=True)
 
-    if calcular:
+    if calcular and not cuotas_reales_confirmadas:
+        st.warning("Antes de calcular el EV+, confirma que has sustituido las cuotas de ejemplo por cuotas reales y actualizadas.")
+
+    if calcular and cuotas_reales_confirmadas:
         try:
             # El motor avanzado ajusta fuerzas sobre resultados históricos, con
             # regularización por muestra y corrección Dixon–Coles para marcadores bajos.

@@ -129,8 +129,13 @@ def ajustar_modelo(
     inicial[0] = np.log(media_goles)
     limites = [(None, None)] * (len(inicial) - 1) + [(-limite_rho, limite_rho)]
     ajuste = minimize(objetivo, inicial, method="L-BFGS-B", bounds=limites)
-    if not np.isfinite(ajuste.fun):
+    if not np.isfinite(ajuste.fun) or not np.isfinite(ajuste.x).all():
         raise RuntimeError(f"No se pudo ajustar el modelo: {ajuste.message}")
+    if not ajuste.success:
+        raise RuntimeError(
+            "El optimizador no convergió; no se generará un pronóstico poco fiable. "
+            f"Detalle: {ajuste.message}"
+        )
 
     ataque, defensa = expandir(ajuste.x[2:-1])
     return ModeloAjustado(
@@ -143,7 +148,10 @@ def ajustar_modelo(
     )
 
 
-def _matriz_dc(lambda_local: float, lambda_visitante: float, rho: float, max_goles: int) -> np.ndarray:
+def _matriz_dc_sin_normalizar(
+    lambda_local: float, lambda_visitante: float, rho: float, max_goles: int
+) -> np.ndarray:
+    """Matriz de probabilidades sin renormalizar, para medir truncamiento."""
     goles = np.arange(max_goles + 1)
     matriz = np.outer(poisson.pmf(goles, lambda_local), poisson.pmf(goles, lambda_visitante))
     matriz[0, 0] *= 1 - lambda_local * lambda_visitante * rho
@@ -151,8 +159,14 @@ def _matriz_dc(lambda_local: float, lambda_visitante: float, rho: float, max_gol
         matriz[0, 1] *= 1 + lambda_local * rho
         matriz[1, 0] *= 1 + lambda_visitante * rho
         matriz[1, 1] *= 1 - rho
-    if (matriz < 0).any() or matriz.sum() <= 0:
+    if not np.isfinite(matriz).all() or (matriz < 0).any() or matriz.sum() <= 0:
         raise ValueError("La corrección Dixon–Coles produjo probabilidades inválidas.")
+    return matriz
+
+
+def _matriz_dc(lambda_local: float, lambda_visitante: float, rho: float, max_goles: int) -> np.ndarray:
+    """Matriz Dixon–Coles normalizada dentro del soporte solicitado."""
+    matriz = _matriz_dc_sin_normalizar(lambda_local, lambda_visitante, rho, max_goles)
     return matriz / matriz.sum()
 
 
@@ -247,5 +261,11 @@ def calcular_partido_poisson(
             for linea in (0.5, 1.5, 2.5, 3.5, 4.5)
         },
         "ambos_marcan": {"si": btts_si, "no": 1.0 - btts_si},
-        "masa_omitida_matriz": float(max(0.0, 1.0 - matriz.sum())),
+        # La matriz visible se mide sin normalizar; así el truncamiento no queda
+        # oculto por la normalización de _matriz_dc.
+        "masa_omitida_matriz": float(
+            max(0.0, 1.0 - _matriz_dc_sin_normalizar(
+                lambda_local, lambda_visitante, rho, max_goles
+            ).sum())
+        ),
     }
